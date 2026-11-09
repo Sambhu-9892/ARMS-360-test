@@ -1,0 +1,82 @@
+# Environment — never commit. `.env.example` is the tracked template.
+.env
+.env.*
+!.env.example
+
+# Local container state
+/var
+*.local
+
+# Node
+node_modules/
+npm-debug.log*
+.npm
+.pnpm-store/
+
+# Build output (backend + frontend)
+dist/
+build/
+.next/
+out/
+.vercel/
+next-env.d.ts
+*.tsbuildinfo
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Unused package managers (this project is built with npm)
+pnpm-lock.yaml
+pnpm-workspace.yaml
+yarn.lock
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+*.pid
+*.seed
+*.pid.lock
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Secrets and credentials — belt and braces alongside the .env rule above
+*.pem
+*.key
+secrets/
+credentials.json
+
+# Production database dumps — contain real student data, never commit.
+# Root-anchored `/*.sql` catches stray dumps such as 3rdNovember.sql without
+# hiding the tracked drizzle migrations under ARMS-360-Backend/drizzle/.
+*.dump
+/*.sql
+*.sql.gz
+deerwalk_erp_backup.dump
+/backups/
+/*.tar
+/*.tar.gz
+/*.zip
+
+# Runtime uploads / generated files
+/uploads/
+data-old/
+
+# Student PII documents (keep the folder marker)
+**/database/studentbirthcertificate/*.pdf
+
+# Local compose overrides often contain secrets
+docker-compose.override.yml
+
+# Editor / caches
+.cursor/
+.husky/_/
+.cache/
+.temp/
+.tmp/

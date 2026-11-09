@@ -1,0 +1,369 @@
+# ARMS360 — full local/production stack.
+#
+#   docker compose up --build -d
+#
+# Topology
+#
+#                      ┌──────────────┐
+#   browser ──────────▶│   frontend   │  :9000  (Next.js, public)
+#                      └──────┬───────┘
+#                             │ server-side rewrite /v1/* and browser fetch
+#                             ▼
+#                      ┌──────────────┐
+#   internet ─────────▶│   gateway    │  :8500  (NestJS, ONLY public backend)
+#                      └──────┬───────┘
+#                 ┌───────────┴────────────┐
+#                 ▼                        ▼
+#      ┌────────────────────┐    ┌────────────────────┐
+#      │ attendance-service │    │  result-service    │   internal only
+#      │       :3001        │    │       :3002        │
+#      └─────────┬──────────┘    └─────────┬──────────┘
+#                └────────────┬────────────┘
+#                             ▼
+#                    ┌─────────────────┐        ┌─────────┐
+#                    │ postgres :5432  │        │ redis   │
+#                    └─────────────────┘        └─────────┘
+#
+# Only `gateway` and `frontend` publish ports. Postgres and Redis are reachable
+# on the internal `backend` network only — see the commented `expose` blocks
+# below if you need to reach them from the host for debugging.
+
+name: arms360
+
+x-backend-env: &backend-env
+  NODE_ENV: ${NODE_ENV:-production}
+  TZ: ${TZ:-Asia/Kathmandu}
+  # All three processes read the same Postgres and Redis in this phase. See
+  # docs/architecture.md for the Phase 2 plan that gives each service its own
+  # database.
+  DATABASE_URL: postgres://${POSTGRES_USER:?set POSTGRES_USER}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB}
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+
+  # --- auth (must be identical across gateway + both services) ---
+  # These are the names src/core/config/auth.config.ts actually reads.
+  # Setting the wrong name is silent: the code falls back to "change-me".
+  JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set JWT_ACCESS_SECRET}
+  JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-12h}
+  JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?set JWT_REFRESH_SECRET}
+  JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-7d}
+  MASTER_PASSWORD: ${MASTER_PASSWORD:-}
+
+  # --- service discovery (used by the gateway's routing layer) ---
+  ATTENDANCE_SERVICE_URL: http://attendance-service:3001
+  RESULT_SERVICE_URL: http://result-service:3002
+  # Shared secret the gateway presents upstream and both services verify
+  # (src/apps/shared/internal-token.guard.ts). Required: generate with
+  #   openssl rand -hex 32
+  INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?set INTERNAL_SERVICE_TOKEN}
+  UPSTREAM_TIMEOUT_MS: ${UPSTREAM_TIMEOUT_MS:-15000}
+  UPSTREAM_RETRIES: ${UPSTREAM_RETRIES:-0}
+  UPSTREAM_RETRY_BACKOFF_MS: ${UPSTREAM_RETRY_BACKOFF_MS:-150}
+  HEALTH_PROBE_TIMEOUT_MS: ${HEALTH_PROBE_TIMEOUT_MS:-2000}
+
+  # --- cors ---
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8500,http://localhost:9000,https://arms360.deerwalk.edu.np}
+
+  # --- mail / alerts ---
+  FRONTEND_URL: ${FRONTEND_URL:-http://localhost:9000}
+  FRONTEND_RESET_PASSWORD_URL: ${FRONTEND_RESET_PASSWORD_URL:-}
+  MAIL_SIGNATURE_BRAND: ${MAIL_SIGNATURE_BRAND:-RND, Deerwalk}
+  MAIL_DEBUG: ${MAIL_DEBUG:-}
+  MAIL_REDIRECT_TO: ${MAIL_REDIRECT_TO:-}
+
+  # --- scheduled production backups to GitHub ---
+  DUMP_GITHUB_TOKEN: ${DUMP_GITHUB_TOKEN:-}
+  DUMP_GITHUB_OWNER: ${DUMP_GITHUB_OWNER:-}
+  DUMP_GITHUB_REPO: ${DUMP_GITHUB_REPO:-}
+  DUMP_GITHUB_BRANCH: ${DUMP_GITHUB_BRANCH:-main}
+  DUMP_GITHUB_PATH: ${DUMP_GITHUB_PATH:-backups}
+  DUMP_GIT_AUTHOR_NAME: ${DUMP_GIT_AUTHOR_NAME:-cronjob}
+  DUMP_GIT_AUTHOR_EMAIL: ${DUMP_GIT_AUTHOR_EMAIL:-noreply@deerwalk.edu.np}
+  BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+
+  # Seed values for the alert_settings table on first boot; afterwards the
+  # super-admin Alerts screen is the source of truth.
+  ALERT_ATTENDANCE_MORNING_ENABLED: ${ALERT_ATTENDANCE_MORNING_ENABLED:-true}
+  ALERT_ATTENDANCE_EVENING_ENABLED: ${ALERT_ATTENDANCE_EVENING_ENABLED:-true}
+  ALERT_ATTENDANCE_REMINDER_ENABLED: ${ALERT_ATTENDANCE_REMINDER_ENABLED:-}
+  ALERT_EXAM_MARKS_ENABLED: ${ALERT_EXAM_MARKS_ENABLED:-true}
+  ALERT_EXAM_MARKS_LEAD_DAYS: ${ALERT_EXAM_MARKS_LEAD_DAYS:-4}
+  ALERT_CAS_MARKS_ENABLED: ${ALERT_CAS_MARKS_ENABLED:-true}
+  ALERT_CAS_MARKS_LEAD_DAYS: ${ALERT_CAS_MARKS_LEAD_DAYS:-4}
+  ALERT_CAS_MARKS_IDLE_WEEKS: ${ALERT_CAS_MARKS_IDLE_WEEKS:-3}
+  ALERT_DELIVERY_ATTEMPTS: ${ALERT_DELIVERY_ATTEMPTS:-3}
+  # Build payloads but do not SMTP-send. Strongly recommended for the first
+  # deploy after the split.
+  ALERT_DRY_RUN: ${ALERT_DRY_RUN:-true}
+  MAIL_HOST: ${MAIL_HOST:-}
+  MAIL_PORT: ${MAIL_PORT:-465}
+  MAIL_USERNAME: ${MAIL_USERNAME:-}
+  MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+  MAIL_ENCRYPTION: ${MAIL_ENCRYPTION:-ssl}
+  MAIL_FROM_ADDRESS: ${MAIL_FROM_ADDRESS:-}
+  MAIL_FROM_NAME: ${MAIL_FROM_NAME:-ARMS360}
+
+  # --- media (ImageKit is the only storage the code reads; AWS_*/MINIO_* are dead) ---
+  IMAGEKIT_PUBLIC_KEY: ${IMAGEKIT_PUBLIC_KEY:-}
+  IMAGEKIT_PRIVATE_KEY: ${IMAGEKIT_PRIVATE_KEY:-}
+  IMAGEKIT_URL_ENDPOINT: ${IMAGEKIT_URL_ENDPOINT:-}
+
+  # --- misc integrations (optional) ---
+  SLACK_BUG_REPORT_WEBHOOK_URL: ${SLACK_BUG_REPORT_WEBHOOK_URL:-}
+  BUG_REPORT_NOTIFICATION_ENABLED: ${BUG_REPORT_NOTIFICATION_ENABLED:-true}
+  BUG_REPORT_FRONTEND_BASE_URL: ${BUG_REPORT_FRONTEND_BASE_URL:-http://localhost:9000}
+  BUG_REPORT_SCREENSHOT_RETENTION_DAYS: ${BUG_REPORT_SCREENSHOT_RETENTION_DAYS:-30}
+  AUTO_CAPTURE_ENABLED: ${AUTO_CAPTURE_ENABLED:-true}
+  GOOGLE_FORMS_ENABLED: ${GOOGLE_FORMS_ENABLED:-false}
+  GOOGLE_FORMS_FORM_ID: ${GOOGLE_FORMS_FORM_ID:-}
+  GOOGLE_FORMS_FIELD_MAPPING: ${GOOGLE_FORMS_FIELD_MAPPING:-}
+  GOOGLE_FORMS_FORM_ID_FRONTEND: ${GOOGLE_FORMS_FORM_ID_FRONTEND:-}
+  GOOGLE_FORMS_FIELD_MAPPING_FRONTEND: ${GOOGLE_FORMS_FIELD_MAPPING_FRONTEND:-}
+  GOOGLE_FORMS_FORM_ID_FRONTEND_MINIMAL: ${GOOGLE_FORMS_FORM_ID_FRONTEND_MINIMAL:-}
+  GOOGLE_FORMS_FIELD_MAPPING_FRONTEND_MINIMAL: ${GOOGLE_FORMS_FIELD_MAPPING_FRONTEND_MINIMAL:-}
+  GITHUB_REPO_OWNER: ${GITHUB_REPO_OWNER:-}
+  GITHUB_REPO_NAME: ${GITHUB_REPO_NAME:-}
+  GITHUB_PROJECT_NUMBER: ${GITHUB_PROJECT_NUMBER:-}
+  GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+  GITHUB_REPO_OWNER_FRONTEND: ${GITHUB_REPO_OWNER_FRONTEND:-}
+  GITHUB_REPO_NAME_FRONTEND: ${GITHUB_REPO_NAME_FRONTEND:-}
+  TRACCAR_URL: ${TRACCAR_URL:-}
+  TRACCAR_USER: ${TRACCAR_USER:-}
+  TRACCAR_PASSWORD: ${TRACCAR_PASSWORD:-}
+
+services:
+  # ---------------------------------------------------------------------
+  # Public entry points
+  # ---------------------------------------------------------------------
+  gateway:
+    build:
+      context: ./ARMS-360-Backend
+      dockerfile: Dockerfile.services
+      args:
+        APP: gateway
+        APP_VERSION: ${APP_VERSION:-dev}
+    image: arms360/gateway:${APP_VERSION:-dev}
+    container_name: arms360-gateway
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      APP: gateway
+      PORT: "3000"
+    ports:
+      # The only backend port exposed publicly.
+      - "${GATEWAY_PORT:-8500}:3000"
+    volumes:
+      - gateway-uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      attendance-service:
+        condition: service_started
+      result-service:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    networks: [backend]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "const p=process.env.PORT||3000;require('http').get('http://127.0.0.1:'+p+'/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  frontend:
+    build:
+      context: ./ARMS-360-Frontend
+      dockerfile: Dockerfile
+      args:
+        # Read at build time by next.config.ts for next/image remotePatterns.
+        NEXT_PUBLIC_IMAGEKIT_URL_ENDPOINT: ${IMAGEKIT_URL_ENDPOINT:-}
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-}
+        # Browser-visible backend origin, used to resolve backend-relative media.
+        # Keep this the public gateway URL, NOT the internal `http://gateway:3000`.
+        NEXT_PUBLIC_BACKEND_BASE_URL: ${NEXT_PUBLIC_BACKEND_BASE_URL:-http://localhost:${GATEWAY_PORT:-8500}}
+        # Baked into .next/routes-manifest.json; must resolve inside the network.
+        BACKEND_BASE_URL: http://gateway:3000
+    image: arms360/frontend:${APP_VERSION:-dev}
+    container_name: arms360-frontend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      TZ: ${TZ:-Asia/Kathmandu}
+      # Server-side rewrite target: browser traffic to /v1/* is proxied by
+      # Next.js to the gateway, which keeps the httpOnly refresh_token cookie
+      # first-party across hard reloads.
+      BACKEND_BASE_URL: http://gateway:3000
+      NEXT_PUBLIC_BACKEND_BASE_URL: ${NEXT_PUBLIC_BACKEND_BASE_URL:-http://localhost:${GATEWAY_PORT:-8500}}
+      NEXT_PUBLIC_IMAGEKIT_URL_ENDPOINT: ${IMAGEKIT_URL_ENDPOINT:-}
+    ports:
+      - "${FRONTEND_PORT:-9000}:9000"
+    depends_on:
+      gateway:
+        condition: service_started
+    networks: [backend]
+    healthcheck:
+      # Any HTTP status below 500 counts as serving. During a deploy the page
+      # can render a client-side error while the gateway is still starting, and
+      # that should not mark the frontend unhealthy.
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "require('http').get('http://127.0.0.1:9000/',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  # ---------------------------------------------------------------------
+  # Business services — internal only, no published ports
+  # ---------------------------------------------------------------------
+  attendance-service:
+    build:
+      context: ./ARMS-360-Backend
+      dockerfile: Dockerfile.services
+      args:
+        APP: attendance-service
+        APP_VERSION: ${APP_VERSION:-dev}
+    image: arms360/attendance-service:${APP_VERSION:-dev}
+    container_name: arms360-attendance-service
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      APP: attendance-service
+      PORT: "3001"
+    volumes:
+      - attendance-uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [backend]
+    healthcheck:
+      # The attendance service also exposes /health/attendance-sessions, the
+      # session-reconciliation deep probe inherited from the monolith.
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "const p=process.env.PORT||3001;require('http').get('http://127.0.0.1:'+p+'/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  result-service:
+    build:
+      context: ./ARMS-360-Backend
+      dockerfile: Dockerfile.services
+      args:
+        APP: result-service
+        APP_VERSION: ${APP_VERSION:-dev}
+    image: arms360/result-service:${APP_VERSION:-dev}
+    container_name: arms360-result-service
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      APP: result-service
+      PORT: "3002"
+    volumes:
+      - result-uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [backend]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "const p=process.env.PORT||3002;require('http').get('http://127.0.0.1:'+p+'/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ---------------------------------------------------------------------
+  # One-shot migration runner — applies all pending drizzle migrations
+  # before any service starts. Exits 0 on success; compose waits for it.
+  # ---------------------------------------------------------------------
+  migrate:
+    build:
+      context: ./ARMS-360-Backend
+      dockerfile: Dockerfile.services
+      target: migrate
+    image: arms360/migrate:${APP_VERSION:-dev}
+    container_name: arms360-migrate
+    environment:
+      <<: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [backend]
+    restart: "no"
+
+  # ---------------------------------------------------------------------
+  # Data stores
+  # ---------------------------------------------------------------------
+  postgres:
+    image: docker.io/library/postgres:18
+    container_name: arms360-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      TZ: ${TZ:-Asia/Kathmandu}
+    # Deliberately NOT published. Uncomment only for local debugging, and
+    # prefer `docker compose exec postgres psql -U $POSTGRES_USER $POSTGRES_DB`.
+    # ports:
+    #   - "127.0.0.1:5555:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  redis:
+    image: docker.io/library/redis:8
+    container_name: arms360-redis
+    restart: unless-stopped
+    # Persist the permissions cache and rate-limit counters so a restart does
+    # not force every service to re-warm from scratch.
+    command: ["redis-server", "--appendonly", "yes"]
+    # Not published by default — see postgres above.
+    volumes:
+      - redis-data:/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  postgres-data:
+  redis-data:
+  gateway-uploads:
+  attendance-uploads:
+  result-uploads:
+
+networks:
+  backend:
+    driver: bridge

@@ -1,0 +1,128 @@
+name: Services CI
+
+# Validates the three-service split on every push and pull request.
+#
+# The monolith pipeline (dev-build.yml) is untouched; this adds the checks that
+# only make sense once the gateway and the two business services exist.
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - 'src/apps/**'
+      - 'tsconfig.app.*.json'
+      - 'package.json'
+      - 'Dockerfile.services'
+      - 'scripts/docker-service-entrypoint.sh'
+  pull_request:
+    paths:
+      - 'src/apps/**'
+      - 'tsconfig.app.*.json'
+      - 'package.json'
+      - 'Dockerfile.services'
+      - 'scripts/docker-service-entrypoint.sh'
+  workflow_dispatch:
+
+concurrency:
+  group: services-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: ARMS-360-Backend
+
+jobs:
+  verify:
+    name: Type-check, test and build services
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: docker.io/library/postgres:18
+        env:
+          POSTGRES_USER: ciuser
+          POSTGRES_PASSWORD: cipass
+          POSTGRES_DB: cidata
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U ciuser -d cidata"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ARMS-360-Backend/package-lock.json
+
+      - run: npm ci
+
+      - name: Type-check each service independently
+        run: |
+          npx tsc -p tsconfig.app.gateway.json --noEmit
+          npx tsc -p tsconfig.app.attendance-service.json --noEmit
+          npx tsc -p tsconfig.app.result-service.json --noEmit
+
+      - name: Lint (no --fix, so CI never rewrites committed code)
+        run: npx eslint "src/apps/**/*.ts"
+
+      # Builds before the tests on purpose: the boundary suite asserts on the
+      # compiled artifacts, so it needs dist/ to exist to be meaningful.
+      - name: Build all three services
+        run: npm run build:services
+
+      - name: Architectural boundary tests
+        run: npm run test:boundary
+
+      - name: Service-layer tests
+        run: npm run test:services
+
+      - name: Full regression suite
+        run: npm test
+        env:
+          DATABASE_URL: postgres://ciuser:cipass@localhost:5432/cidata
+          REDIS_HOST: localhost
+
+      - name: Verify every service emits its entrypoint
+        run: |
+          for s in gateway attendance-service result-service; do
+            test -f "dist/$s/apps/$s/main.js" || { echo "missing dist/$s/apps/$s/main.js"; exit 1; }
+            echo "ok  dist/$s/apps/$s/main.js"
+          done
+
+      - name: Validate the service image builds
+        run: |
+          for app in gateway attendance-service result-service; do
+            echo "::group::build $app"
+            docker build -f Dockerfile.services \
+              --build-arg APP="$app" \
+              --build-arg APP_VERSION=ci \
+              -t "arms360/$app:ci" .
+            echo "::endgroup::"
+          done
+
+  compose:
+    name: Root Compose config is valid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Renders the stack with every required value present and asserts the
+      # data stores are not published to the host. A missing REQUIRED var or an
+      # accidental `ports:` on postgres/redis fails here rather than in prod.
+      - name: Render and assert
+        run: |
+          POSTGRES_USER=ciuser POSTGRES_PASSWORD=cipass POSTGRES_DB=cidata \
+          JWT_ACCESS_TOKEN_SECRET=ci JWT_REFRESH_TOKEN_SECRET=ci \
+          INTERNAL_SERVICE_TOKEN=ci \
+          docker compose config > /tmp/rendered.yml
+
+      # Same assertions, but runs without Docker - useful locally too.
+      - name: Validate compose (no Docker required)
+        run: |
+          POSTGRES_USER=ciuser POSTGRES_PASSWORD=cipass POSTGRES_DB=cidata \
+          JWT_ACCESS_TOKEN_SECRET=ci JWT_REFRESH_TOKEN_SECRET=ci \
+          INTERNAL_SERVICE_TOKEN=ci \
+          python3 scripts/validate-compose.py --env-file /dev/null
